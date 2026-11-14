@@ -38,8 +38,13 @@ def _wiki_api(params: dict) -> dict:
     params = {"format": "json", **params}
     url = WIKI_ZH + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read(1_000_000).decode("utf-8"))  # 响应体上限 1MB
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} {e.reason}") from e
+    except Exception as e:
+        raise RuntimeError(f"网络或解析失败:{e}") from e
 
 
 def _ensure_dirs():
@@ -63,10 +68,22 @@ def muse_seed(brief: str) -> str:
 
     brief: 创作命题,如"一岁一枯荣 的动画"
     """
+    brief = brief.strip()
+    if not brief:
+        return "(命题为空;给一句话命题)"
+    if len(brief) > 2000:
+        brief = brief[:2000] + "…(已截断)"
     _ensure_dirs()
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = RUNS / run_id
-    run_dir.mkdir()
+    base = time.strftime("%Y%m%d-%H%M%S")
+    suffix = 0
+    while True:
+        run_id = base if suffix == 0 else f"{base}-{suffix}"
+        run_dir = RUNS / run_id
+        try:
+            run_dir.mkdir()  # mkdir 原子,失败即说明同秒已有运行(P1 修复)
+            break
+        except FileExistsError:
+            suffix += 1
     (run_dir / "brief.md").write_text(
         f"# 命题\n\n{brief}\n", encoding="utf-8")
     guide = f"""运行 ID: {run_id}
@@ -102,9 +119,14 @@ def muse_random(n: int = 5) -> str:
     信号往往在标题的名字、数字、地名里,不在正文里。
     """
     n = max(1, min(n, 20))
-    data = _wiki_api({"action": "query", "list": "random",
-                      "rnnamespace": 0, "rnlimit": n})
-    titles = [p["title"] for p in data["query"]["random"]]
+    try:
+        data = _wiki_api({"action": "query", "list": "random",
+                          "rnnamespace": 0, "rnlimit": n})
+        titles = [p["title"] for p in data.get("query", {}).get("random", [])]
+    except Exception as e:
+        return f"(维基百科暂时不可用:{e};稍后重试或换信号源)"
+    if not titles:
+        return "(维基百科返回异常(无随机结果);稍后再试)"
     return "随机条目(只扫标题,有感觉再 peek):\n" + "\n".join(
         f"- {t}" for t in titles)
 
@@ -115,10 +137,13 @@ def muse_peek(title: str) -> str:
 
     title: 条目标题(通常是 muse_random 抽到的)
     """
-    data = _wiki_api({"action": "query", "prop": "extracts",
-                      "explaintext": 1, "exintro": 1, "redirects": 1,
-                      "titles": title})
-    pages = data["query"]["pages"]
+    try:
+        data = _wiki_api({"action": "query", "prop": "extracts",
+                          "explaintext": 1, "exintro": 1, "redirects": 1,
+                          "titles": title})
+        pages = data.get("query", {}).get("pages", {})
+    except Exception as e:
+        return f"(维基百科暂时不可用:{e})"
     for p in pages.values():
         if "extract" in p and p["extract"].strip():
             return p["extract"].strip()
@@ -133,13 +158,24 @@ def muse_material_search(query: str) -> str:
     空库返回空是正常行为:发散时扩大信号覆盖即可,不必卡住。
     """
     _ensure_dirs()
+    query = query.strip()
+    if not query:
+        return "(空查询;给一个关键词)"
+    if len(query) > 100:
+        query = query[:100]
     hits = []
     for md in sorted(LIB.glob("*.md")):
+        if md.stat().st_size > 1_000_000:
+            continue  # 超大文件跳过,防返回内容爆炸
         lines = md.read_text(encoding="utf-8").splitlines()
+        skip_until = -1
         for i, line in enumerate(lines):
+            if i <= skip_until:
+                continue
             if query.lower() in line.lower():
                 entry = lines[max(0, i - 4): i + 2]
                 hits.append(f"[{md.name}]\n" + "\n".join(entry))
+                skip_until = i + 1  # 相邻命中合并为一条,不重复返回
     if not hits:
         return f"(素材库无《{query}》命中。空库不是阻塞——扩大信号覆盖继续发散。)"
     return "\n\n---\n\n".join(hits[:10])
@@ -153,6 +189,12 @@ def muse_park(text: str, source: str = "") -> str:
     text: 要寄存的内容(一段画面、一个词条、一个火花)
     source: 可选来源说明,如"维基随机条目:赤根智子"
     """
+    text = text.strip()
+    if not text:
+        return "(空内容;给一段素材)"
+    if len(text) > 20000:
+        text = text[:20000] + "…(已截断)"
+    source = (source or "").strip()[:200]
     ts = time.strftime("%Y-%m-%d %H:%M")
     head = f"## 寄存 {ts}" + (f"  (来源: {source})" if source else "")
     _append(INBOX, f"{head}\n\n{text}")
@@ -167,9 +209,18 @@ def muse_archive(run_id: str, report: str) -> str:
     run_id: muse_seed 返回的运行 ID
     report: 蒸馏后的归档文本,建议每条含 idea + 死因/活因
     """
+    if not re.fullmatch(r"\d{8}-\d{6}(-\d+)?", run_id):
+        return f"(运行 ID 不合法:{run_id};请用 muse_seed 返回的 ID)"
+    report = report.strip()
+    if not report:
+        return "(空报告;先跑完试炼再归档)"
+    if len(report) > 50000:
+        report = report[:50000] + "…(已截断)"
     run_dir = RUNS / run_id
     if not run_dir.is_dir():
         return f"(运行 {run_id} 不存在;先用 muse_seed)"
+    if EARNED.exists() and f"## {run_id} " in EARNED.read_text(encoding="utf-8"):
+        return f"(运行 {run_id} 已归档过;如需补充请手动编辑 library/earned.md)"
     ts = time.strftime("%Y-%m-%d %H:%M")
     _append(EARNED, f"## {run_id}  {ts}  (earned)\n\n{report}")
     return f"已归档 {run_id} 到 library/earned.md。"
