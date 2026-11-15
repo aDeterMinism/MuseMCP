@@ -135,10 +135,11 @@ def _reference_md(k: int, brief: str, title: str, extract: str, kind: str) -> st
 
 
 def _deal_reply(run_id: str, n: int) -> str:
-    paths = "\n".join(f"- runs/{run_id}/branch-{k}" for k in range(1, n + 1))
+    run_dir = RUNS / run_id  # 绝对路径:主会话 cwd 与服务器 ROOT 不同,相对路径会被按 cwd 解释
+    paths = "\n".join(f"- {run_dir / f'branch-{k}'}" for k in range(1, n + 1))
     return f"""已发牌:运行 {run_id},共 {n} 个分支(重调幂等,不会重发)。
 
-工作区(牌面已落盘到各自 reference.md。不要读它们——你先看了再转述,就把你的锚定带给了子代理):
+工作区(绝对路径,与主会话 cwd 无关;牌面已落盘到各自 reference.md。不要读它们——你先看了再转述,就把你的锚定带给了子代理):
 
 {paths}
 
@@ -148,7 +149,7 @@ def _deal_reply(run_id: str, n: int) -> str:
 {SPAWN_TEMPLATE}
 ```
 
-n 份 report.md 齐了之后:读 runs/{run_id}/branch-*/report.md 排名汇总,再 muse_archive。"""
+n 份 report.md 齐了之后:读 {run_dir}/branch-*/report.md 排名汇总,再 muse_archive。"""
 
 
 # ---------- tools ----------
@@ -178,7 +179,7 @@ def muse_seed(brief: str) -> str:
     (run_dir / "brief.md").write_text(
         f"# 命题\n\n{brief}\n", encoding="utf-8")
     guide = f"""运行 ID: {run_id}
-命题已存入 runs/{run_id}/brief.md
+命题已存入 {run_dir / 'brief.md'}
 
 试炼工作流指引(由你——主会话——执行;MCP 负责发牌与记忆,试炼由隔离子智能体做):
 
@@ -188,7 +189,7 @@ def muse_seed(brief: str) -> str:
 2. 【试炼】按 muse_deal 返回的拉起模板,每个分支起一个隔离子智能体,
    同一条消息里并行发出;prompt 只含分支号与工作区路径,
    不含你对信号的任何解读。各分支自己产出 report.md。
-3. 【编辑】读完 runs/{run_id}/branch-*/report.md,排名并给出最终汇报。
+3. 【编辑】读完 {run_dir}/branch-*/report.md,排名并给出最终汇报。
 4. 【归档】把幸存方案与有价值的否决理由交给 muse_archive。
 """
     return guide
