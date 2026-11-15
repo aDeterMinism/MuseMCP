@@ -5,6 +5,7 @@
 发散与试炼由宿主会话完成。素材库就是本目录下的 library/ 文件夹。
 """
 import json
+import random
 import re
 import time
 import urllib.parse
@@ -21,13 +22,28 @@ RUNS = ROOT / "runs"
 WIKI_ZH = "https://zh.wikipedia.org/w/api.php"
 UA = "MuseMCP/0.1 (personal creative tool)"
 
+# 切入视角轮转池:保证一次运行的 n 个分支覆盖多种视角(DESIGN.md 的"≥3 种信号类型")
+DEAL_TYPES = ["结构", "叙事原型", "风格", "事件", "受众", "感官材质", "媒介手法"]
+
+# 主会话拉起子智能体的固定模板(prompt 只换 {k} 与 {path} 两个变量)
+SPAWN_TEMPLATE = """你是分支 {k}。工作区:{path}。
+第一步:Read {path}/reference.md,里面有命题、你的信号和工作规则。
+禁止访问 muse MCP 的任何工具;禁止读取工作区以外的任何项目文件。
+产出:Write {path}/report.md,格式见 reference.md 末尾。"""
+
+# 试炼报告模板(写进每个分支的 reference.md 末尾)
+REPORT_TEMPLATE = """verdict: keep / pivot / kill
+concept: 若活着——logline、关键画面、与命题的契合点
+kill:   是什么(或差点)杀死它——这条本身是素材
+pivot:  若转向——转向成了什么"""
+
 mcp = FastMCP(
     "muse",
     instructions=(
-        "创作灵感 MCP。典型流程: muse_seed(命题) 拿到工作流指引 → muse_random 抽随机条目"
-        "当信号 → muse_peek 展开感兴趣者 → muse_material_search 检索素材库 → "
-        "主会话自己产出 n 张方向卡 → 起 n 个隔离智能体试炼 → muse_archive 归档。"
-        "任何时刻可用 muse_park 随手寄存素材。"
+        "创作灵感 MCP。典型流程: muse_seed(命题) 开运行 → muse_deal 确定性发牌、"
+        "建 n 个分支工作区(参考内容直接落盘,主会话不见牌面) → "
+        "主会话按发牌返回的模板机械地起 n 个隔离智能体试炼 → 汇总报告 → muse_archive 归档。"
+        "任何时刻可用 muse_park 随手寄存素材;muse_random / muse_peek 可作临时信号。"
     ),
 )
 
@@ -60,6 +76,81 @@ def _append(path: Path, text: str):
         f.write(text.rstrip() + "\n\n")
 
 
+def _wiki_extract(title: str) -> str:
+    """取条目简介,失败静默返回空串(发牌不能因单条网络错误中断)。"""
+    try:
+        data = _wiki_api({"action": "query", "prop": "extracts",
+                          "explaintext": 1, "exintro": 1, "redirects": 1,
+                          "titles": title})
+        for p in data.get("query", {}).get("pages", {}).values():
+            if p.get("extract", "").strip():
+                return p["extract"].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _read_brief(run_dir: Path) -> str:
+    """从 brief.md 取命题正文(去掉标题行)。"""
+    try:
+        lines = (run_dir / "brief.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "(命题缺失)"
+    body = [l for l in lines if l.strip() and not l.startswith("# ")]
+    return "\n".join(body).strip() or "(命题缺失)"
+
+
+def _reference_md(k: int, brief: str, title: str, extract: str, kind: str) -> str:
+    sig = f"维基随机条目:《{title}》"
+    if extract:
+        sig += f"\n\n{extract}"
+    else:
+        sig += "\n\n(该条目没有正文简介;没关系——信号在标题的名字、数字、地名里,直接从标题出发。)"
+    return f"""# 分支 {k} 参考材料
+
+## 命题
+
+{brief}
+
+## 你的信号
+
+{sig}
+
+## 切入视角(建议;可偏离,但偏离要有理由)
+
+{kind}——从这个视角把信号发展成一个具体方向。
+经验:信号往往在名字、数字、地名的低层,不在条目正文里。别被简介带跑。
+
+## 工作规则
+
+1. 一切读写限制在本目录;禁止访问 muse MCP 的任何工具;禁止读取其他分支目录。
+2. 先发展:把信号和命题推成一个具体方案(logline、关键画面)。
+3. 再审判:诚实地攻击它,写清楚是什么(或差点)杀死它。
+4. 报告写为本目录下的 report.md:
+
+```
+{REPORT_TEMPLATE}
+```
+"""
+
+
+def _deal_reply(run_id: str, n: int) -> str:
+    paths = "\n".join(f"- runs/{run_id}/branch-{k}" for k in range(1, n + 1))
+    return f"""已发牌:运行 {run_id},共 {n} 个分支(重调幂等,不会重发)。
+
+工作区(牌面已落盘到各自 reference.md。不要读它们——你先看了再转述,就把你的锚定带给了子代理):
+
+{paths}
+
+拉起模板(每个分支一次 Agent 调用,同一条消息里并行发出;prompt 只换 {{k}} 与 {{path}}):
+
+```
+{SPAWN_TEMPLATE}
+```
+
+n 份 report.md 齐了之后:读 runs/{run_id}/branch-*/report.md 排名汇总,再 muse_archive。"""
+
+
 # ---------- tools ----------
 
 @mcp.tool()
@@ -89,26 +180,82 @@ def muse_seed(brief: str) -> str:
     guide = f"""运行 ID: {run_id}
 命题已存入 runs/{run_id}/brief.md
 
-试炼工作流指引(由你——主会话——执行,MCP 不参与发散与试炼):
+试炼工作流指引(由你——主会话——执行;MCP 负责发牌与记忆,试炼由隔离子智能体做):
 
-1. 【信号】用 muse_random(n) 抽随机条目,扫标题,感兴趣的用 muse_peek 展开;
-   也可注入其他当次信号(热搜、近期事件)。
-2. 【发散】产出 n 张方向卡(5-8 张,覆盖至少 3 种信号类型),每张含:
-   - idea: 一句话创意方向
-   - signal: 风格 / 事件 / 结构 / 受众 / 私人素材(哪一类)
-   - angle: 具体到本命题的切入
-   - kill_hint: 它最可能死于什么
-   卡片存入 runs/{run_id}/cards.md。
-3. 【试炼】每个方向卡交给一个相互隔离的子智能体(各自独立工作区、
-   禁止访问 muse MCP、互相看不到),每人产出报告:
-   - verdict: keep / pivot / kill
-   - concept: 若活着——logline、关键画面、与命题的契合点
-   - kill: 是什么(或差点)杀死它——这条本身是素材
-   - pivot: 若转向——转向成了什么
-   报告汇总存入 runs/{run_id}/reports/。
+1. 【发牌】调用 muse_deal("{run_id}", n),n 取 5-8。MCP 会确定性抽信号、
+   建 n 个分支工作区并把参考内容写进各自 reference.md。返回值只有路径,
+   牌面你不要看——你先读了再转述,就把你的锚定带给了子代理。
+2. 【试炼】按 muse_deal 返回的拉起模板,每个分支起一个隔离子智能体,
+   同一条消息里并行发出;prompt 只含分支号与工作区路径,
+   不含你对信号的任何解读。各分支自己产出 report.md。
+3. 【编辑】读完 runs/{run_id}/branch-*/report.md,排名并给出最终汇报。
 4. 【归档】把幸存方案与有价值的否决理由交给 muse_archive。
 """
     return guide
+
+
+@mcp.tool()
+def muse_deal(run_id: str, n: int = 5) -> str:
+    """确定性发牌:为一次运行建 n 个分支工作区,给每分支分配一个
+    维基随机信号,参考内容直接写进该分支的 reference.md。
+
+    用 run_id 作种子,分支 k 拿到什么完全由 (run_id, k) 决定;
+    返回值只含目录路径与拉起模板,不含牌面(主会话不接触信号内容)。
+    幂等:同一运行重复调用返回已发出的牌,不重发。
+
+    run_id: muse_seed 返回的运行 ID
+    n: 分支数(5-8)
+    """
+    if not re.fullmatch(r"\d{8}-\d{6}(-\d+)?", run_id):
+        return f"(运行 ID 不合法:{run_id};请用 muse_seed 返回的 ID)"
+    n = max(1, min(n, 8))
+    run_dir = RUNS / run_id
+    if not run_dir.is_dir():
+        return f"(运行 {run_id} 不存在;先用 muse_seed)"
+
+    deal_file = run_dir / "deal.json"
+    if deal_file.exists():  # 幂等:已发过牌,只回路径
+        try:
+            deal = json.loads(deal_file.read_text(encoding="utf-8"))
+            return _deal_reply(run_id, len(deal["branches"]))
+        except Exception:
+            pass  # deal.json 损坏则重发覆盖
+
+    # 1) 抽候选:多抽一倍,种子化洗牌后取前 n 个(分配过程零模型参与)
+    try:
+        data = _wiki_api({"action": "query", "list": "random",
+                          "rnnamespace": 0, "rnlimit": min(max(n * 2, 10), 20)})
+        pool = [p["title"] for p in data.get("query", {}).get("random", [])]
+    except Exception as e:
+        return f"(维基百科暂时不可用:{e};稍后重试发牌)"
+    pool = list(dict.fromkeys(pool))  # 去重,保序
+    if not pool:
+        return "(维基百科返回异常(无随机结果);稍后重试发牌)"
+    rng = random.Random(run_id)  # 种子 = run_id,分配可复现、可审计
+    rng.shuffle(pool)
+    picks = pool[:n]
+
+    # 2) 覆盖保证:视角从轮转池里种子化排序分配
+    kinds = DEAL_TYPES[:]
+    rng.shuffle(kinds)
+
+    # 3) 建工作区、落盘参考内容(逐分支容错:单条简介抓不到不影响发牌)
+    brief = _read_brief(run_dir)
+    branches = []
+    for k, title in enumerate(picks, start=1):
+        d = run_dir / f"branch-{k}"
+        d.mkdir(exist_ok=True)
+        (d / "reference.md").write_text(
+            _reference_md(k, brief, title, _wiki_extract(title), kinds[(k - 1) % len(kinds)]),
+            encoding="utf-8")
+        branches.append({"k": k, "dir": f"branch-{k}", "title": title,
+                         "kind": kinds[(k - 1) % len(kinds)]})
+
+    # 4) 审计留痕:牌面只进 deal.json(在磁盘上,不在主会话上下文里)
+    deal_file.write_text(json.dumps(
+        {"run_id": run_id, "seed": run_id, "n": n, "branches": branches},
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    return _deal_reply(run_id, n)
 
 
 @mcp.tool()
